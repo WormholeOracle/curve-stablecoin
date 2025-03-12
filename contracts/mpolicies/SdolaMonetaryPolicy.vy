@@ -1,17 +1,16 @@
 # @version 0.3.10
 """
-@title SusdeMonetaryPolicy
-@notice Based on SecondaryMonetaryPolicy, however following EMA of sUSDe yield rate
+@title SdolaMonetaryPolicy
+@notice Based on SecondaryMonetaryPolicy, however following EMA of sDOLA yield rate
 @author Curve.fi
 @license Copyright (c) Curve.Fi, 2020-2024 - all rights reserved
 """
 from vyper.interfaces import ERC20
 
 
-interface EthenaVault:
+interface InverseVault:
     def totalAssets() -> uint256: view
-    def vestingAmount() -> uint256: view
-    def lastDistributionTimestamp() -> uint256: view
+    def weeklyRevenue(epoch: uint256) -> uint256: view
 
 interface Controller:
     def total_debt() -> uint256: view
@@ -37,26 +36,27 @@ MAX_UTIL: constant(uint256)  = 99 * 10**16
 MIN_LOW_RATIO: constant(uint256)  = 10**16
 MAX_HIGH_RATIO: constant(uint256) = 100 * 10**18
 MAX_RATE_SHIFT: constant(uint256) = 100 * 10**18
+WEEK: constant(uint256) = 86400 * 7
 
-VESTING_PERIOD: public(constant(uint256)) = 8 * 3600
 TEXP: public(constant(uint256)) = 200_000
 
 BORROWED_TOKEN: public(immutable(ERC20))
 FACTORY: public(immutable(Factory))
-SUSDE: public(immutable(EthenaVault))
+SDOLA: public(immutable(InverseVault))
 
 parameters: public(Parameters)
-prev_ma_susde_rate: uint256
-prev_susde_rate: uint256
+prev_ma_sdola_rate: uint256
+prev_sdola_rate: uint256
 last_timestamp: uint256
+epoch: uint256
 
 
 @external
-def __init__(factory: Factory, susde: EthenaVault, borrowed_token: ERC20,
+def __init__(factory: Factory, sdola: InverseVault, borrowed_token: ERC20,
              target_utilization: uint256, low_ratio: uint256, high_ratio: uint256, rate_shift: uint256):
     """
     @param factory Factory contract
-    @param susde SUSDE contract (vault)
+    @param sdola SDOLA contract (vault)
     @param borrowed_token Borrowed token in the market (e.g. crvUSD)
     @param target_utilization Utilization at which borrow rate is the same as in AMM
     @param low_ratio Ratio rate/target_rate at 0% utilization
@@ -71,13 +71,14 @@ def __init__(factory: Factory, susde: EthenaVault, borrowed_token: ERC20,
     assert rate_shift <= MAX_RATE_SHIFT
 
     FACTORY = factory
-    SUSDE = susde
+    SDOLA = sdola
     BORROWED_TOKEN = borrowed_token
 
-    r: uint256 = self.raw_susde_rate()
-    self.prev_susde_rate = r
-    self.prev_ma_susde_rate = r
+    r: uint256 = self.raw_sdola_rate()
+    self.prev_sdola_rate = r
+    self.prev_ma_sdola_rate = r
     self.last_timestamp = block.timestamp
+    self.epoch = (block.timestamp / WEEK) - 1
 
     p: Parameters = self.get_params(target_utilization, low_ratio, high_ratio, rate_shift)
     self.parameters = p
@@ -122,44 +123,49 @@ def exp(power: int256) -> uint256:
 
 @internal
 @view
-def raw_susde_rate() -> uint256:
-    assets: uint256 = SUSDE.totalAssets()
+def raw_sdola_rate() -> uint256:
+    assets: uint256 = SDOLA.totalAssets()
     if assets > 0:
-        return SUSDE.vestingAmount() * 10**18 / (SUSDE.totalAssets() * VESTING_PERIOD)
+        epoch: uint256 = self.epoch
+        rev: uint256 = SDOLA.weeklyRevenue(epoch)
+        return rev * 10**18 / (assets * 7)
     else:
         return 0
 
 
 @external
 @view
-def raw_susde_apr() -> uint256:
-    return self.raw_susde_rate() * (365 * 86400)
+def raw_sdola_apr() -> uint256:
+    return self.raw_sdola_rate() * 365
 
 
 @internal
 @view
-def ema_susde_rate() -> uint256:
+def ema_sdola_rate() -> uint256:
     last_timestamp: uint256 = self.last_timestamp
     if last_timestamp == block.timestamp:
-        return self.prev_ma_susde_rate
+        return self.prev_ma_sdola_rate
     else:
         alpha: uint256 = self.exp(- convert((block.timestamp - last_timestamp) * (10**18 / TEXP), int256))
-        return (self.prev_susde_rate * (10**18 - alpha) + self.prev_ma_susde_rate * alpha) / 10**18
+        return (self.prev_sdola_rate * (10**18 - alpha) + self.prev_ma_sdola_rate * alpha) / 10**18
 
 
 @external
 @view
-def ma_susde_rate() -> uint256:
-    return self.ema_susde_rate()
+def ma_sdola_rate() -> uint256:
+    return self.ema_sdola_rate()
 
 
 @internal
-def ema_susde_rate_w() -> uint256:
-    r: uint256 = self.ema_susde_rate()
-    self.prev_ma_susde_rate = r
-    if SUSDE.lastDistributionTimestamp() > self.last_timestamp:
-        self.prev_susde_rate = self.raw_susde_rate()
+def ema_sdola_rate_w() -> uint256:
+    r: uint256 = self.ema_sdola_rate()
+    self.prev_ma_sdola_rate = r
+    epoch: uint256 = (block.timestamp / WEEK) - 1
+    distro: uint256 = epoch * WEEK
+    if distro > self.last_timestamp:
+        self.prev_sdola_rate = self.raw_sdola_rate()
     self.last_timestamp = block.timestamp
+    self.epoch = epoch
     return r
 
 
@@ -193,12 +199,12 @@ def calculate_rate(_for: address, d_reserves: int256, d_debt: int256, r0: uint25
 @view
 @external
 def rate(_for: address = msg.sender) -> uint256:
-    return self.calculate_rate(_for, 0, 0, self.ema_susde_rate())
+    return self.calculate_rate(_for, 0, 0, self.ema_sdola_rate())
 
 
 @external
 def rate_write(_for: address = msg.sender) -> uint256:
-    return self.calculate_rate(_for, 0, 0, self.ema_susde_rate_w())
+    return self.calculate_rate(_for, 0, 0, self.ema_sdola_rate_w())
 
 
 @external
@@ -226,4 +232,4 @@ def set_parameters(target_utilization: uint256, low_ratio: uint256, high_ratio: 
 @view
 @external
 def future_rate(_for: address, d_reserves: int256, d_debt: int256) -> uint256:
-    return self.calculate_rate(_for, d_reserves, d_debt, self.ema_susde_rate())
+    return self.calculate_rate(_for, d_reserves, d_debt, self.ema_sdola_rate())
